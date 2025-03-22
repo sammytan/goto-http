@@ -1,0 +1,11 @@
+time="2025-03-22T12:01:02+07:00" level=info msg="User-Agent manager initialized" module=attack
+time="2025-03-22T12:01:02+07:00" level=info msg="Initializing HTTP client" debug=true force_http2=false keep_alive=false max_conns=100 module=attack timeout=30s
+time="2025-03-22T12:01:02+07:00" level=info msg="Using dynamic proxy selection from proxy manager" module=attack
+time="2025-03-22T12:01:02+07:00" level=info msg="HTTP client initialized successfully" http2_enabled=false module=attack proxy_enabled=true
+time="2025-03-22T12:01:02+07:00" level=info msg="Using WebSocket dialer with dynamic proxy selection" module=attack
+time="2025-03-22T12:01:02+07:00" level=info msg="WebSocket client initialized successfully" module=attack
+time="2025-03-22T12:01:02+07:00" level=info msg="Starting attack against http://waf.witercloud.com/612ELmDS/" module=attack
+time="2025-03-22T12:01:02+07:00" level=info msg="Attack options: method=GET, rate=1, workers=1, duration=20s" module=attack
+time="2025-03-22T12:01:02+07:00" level=info msg="Target URL contains random variables (http://waf.witercloud.com/%RANDSTR%/), each request will use a new random URL" module=attack
+time="2025-03-22T12:01:02+07:00" level=info msg="Worker started" module=attack worker=0
+time="2025-03-22T12:01:22+07:00" level=info msg="Attack duration reached" module=attack

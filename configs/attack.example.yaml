@@ -1,0 +1,40 @@
+# goto-http 攻击配置文件示例
+version: "1.0.0"
+debug: false
+
+# GUI配置
+gui:
+  web:
+    enable: false  # 默认不启用Web界面
+    port: ":8080"
+  terminal:
+    enable: false  # 默认不启用终端界面
+
+# 系统配置
+system:
+  max_procs: 4
+  max_files: 1000000
+  cpu_limit: 80  # CPU使用限制(%)
+  mem_limit: 1024  # 内存使用限制(MB)
+
+# 攻击配置
+attack:
+  target: "http://example.com"
+  method: "GET"
+  duration: "5m"
+  rate: 100  # 每秒请求数
+  workers: 10  # 并发工作者数
+  timeout: "5s"
+  mode: "get-flood"  # 可选: get-flood, post-flood, slowloris, http2-priority, http2-rst, ws-flood, smart-flood, protocol-confusion
+  
+  # 请求头配置
+  headers:
+    # User-Agent配置
+    user_agent:
+      type: "random"  # 可选: cn_mobile, cn_app, global_mobile, pc, search_engine, random, custom
+      custom_file: ""  # 当type为custom时，指定自定义UA文件路径
+    # 其他请求头
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9"
+    Accept-Language: "en-US,en;q=0.9"
+  
+  body: ""  # POST请求体 

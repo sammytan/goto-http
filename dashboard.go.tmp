@@ -1,0 +1,2026 @@
+package termui
+
+import (
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"log"
+	"math"
+	"math/rand"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/gizak/termui/v3"
+	"github.com/gizak/termui/v3/widgets"
+)
+
+// Stats holds the dashboard statistics
+type Stats struct {
+	Start               time.Time
+	Duration            time.Duration
+	Total               uint64
+	Success             uint64
+	Failed              uint64
+	BytesSent           int64
+	BytesReceived       int64
+	MinLatency          int64
+	MaxLatency          int64
+	TotalLatency        int64
+	Codes               map[int]int64
+	Errors              map[string]int
+	LatencyDistribution map[int64]int64
+	Mu                  sync.RWMutex
+}
+
+// Dashboard represents the terminal UI dashboard
+type Dashboard struct {
+	mu sync.RWMutex
+
+	// Header section
+	headerBox    *widgets.Paragraph
+	targetURL    string
+	attackMode   string
+	attackTime   int
+	timeLeft     int
+	bandwidth    float64
+	totalTraffic float64
+
+	// Job info section
+	jobInfoBox *widgets.Paragraph
+	works      int
+	interval   int
+	rates      int
+	referer    string
+	headers    string
+	cookies    string
+	postData   string
+	proxyType  string
+	uaType     string
+	bypassType string
+
+	// Counts section - 拆分为两个独立区域
+	targetCountsBox *widgets.Paragraph // 目标请求统计
+	proxyCountsBox  *widgets.Paragraph // 代理请求统计
+	networkStatsBox *widgets.Paragraph // 网络数据统计
+	targetCount     int64
+	requestOK       int64
+	requestFail     int64
+	proxyCount      int
+	proxyReqOK      int64
+	proxyReqFail    int64
+	proxyBandwidth  float64 // 代理传输带宽
+
+	// OS stats section
+	osStatsBox  *widgets.Gauge
+	cpuGauge    *widgets.Gauge
+	memGauge    *widgets.Gauge
+	gcGauge     *widgets.Gauge
+	bwUpGauge   *widgets.Gauge
+	bwDownGauge *widgets.Gauge
+
+	// Charts
+	rpsChart      *widgets.Plot
+	responseChart *widgets.Plot
+	responseCodes *widgets.BarChart
+	serverIPs     *widgets.Paragraph
+
+	// Request table
+	requestTable *widgets.Table
+
+	// Stats data
+	stats               *Stats
+	cpuUsage            float64
+	memUsage            float64
+	gcUsage             float64
+	uploadSpeed         float64
+	downloadSpeed       float64
+	maxBandwidth        float64
+	currentRPS          []float64
+	currentResponseTime []float64
+	serverIPStats       map[string]int64
+
+	// Debug flag
+	debug bool
+
+	// Layout settings
+	rowSpacing int
+
+	// UI configuration - persistent settings
+	uiConfig *UIConfig
+	visible  map[string]bool
+
+	// Last request data
+	lastRequest map[string]interface{}
+
+	// Control
+	done    chan struct{}
+	stopped bool
+}
+
+// UIConfig holds persistent UI configuration
+type UIConfig struct {
+	// Layout preferences
+	LayoutVersion       int             // Version of layout to use
+	ComponentOrder      []string        // Order of components
+	ComponentVisibility map[string]bool // Which components are visible
+	ColorScheme         string          // Name of color scheme
+
+	// Display format preferences
+	DataFormatters map[string]string // How to format different data types
+
+	// Box sizing
+	ColumnRatios []float64      // Relative widths for columns
+	RowHeights   map[string]int // Custom heights for rows
+}
+
+// NewUIConfig creates a default UI configuration
+func NewUIConfig() *UIConfig {
+	return &UIConfig{
+		LayoutVersion: 1,
+		ComponentOrder: []string{
+			"header", "charts", "info", "os", "codes", "table",
+		},
+		ComponentVisibility: map[string]bool{
+			"header": true, "charts": true, "info": true,
+			"os": true, "codes": true, "table": true,
+		},
+		ColorScheme: "hackerRed",
+		DataFormatters: map[string]string{
+			"bandwidth":  "%.2f Mbps",
+			"traffic":    "%.2f GB",
+			"percentage": "%.1f%%",
+		},
+		ColumnRatios: []float64{0.25, 0.25, 0.25, 0.25}, // Equal 4-column layout
+		RowHeights: map[string]int{
+			"header": 4,
+			"charts": 12,
+			"info":   6,
+			"os":     3,
+			"codes":  6,
+		},
+	}
+}
+
+// NewDashboard creates a new dashboard instance
+func NewDashboard() (*Dashboard, error) {
+	if err := termui.Init(); err != nil {
+		return nil, fmt.Errorf("failed to initialize termui: %v", err)
+	}
+
+	// Create default data for time series charts
+	defaultRPS := make([]float64, 100)
+	defaultRT := make([]float64, 100)
+	for i := 0; i < 100; i++ {
+		defaultRPS[i] = 0.1 // Small non-zero value to show the line
+		defaultRT[i] = 10.0 // Small non-zero value for response time
+	}
+
+	d := &Dashboard{
+		done: make(chan struct{}),
+		// Initialize with default values
+		stats: &Stats{
+			Start:               time.Now(),
+			Codes:               make(map[int]int64),
+			Errors:              make(map[string]int),
+			LatencyDistribution: make(map[int64]int64),
+			Total:               0,
+			Success:             0,
+			Failed:              0,
+		},
+		currentRPS:          defaultRPS,
+		currentResponseTime: defaultRT,
+		// Set initial values for display
+		targetURL:    "Not set",
+		attackMode:   "Not set",
+		attackTime:   0,
+		timeLeft:     0,
+		bandwidth:    0,
+		totalTraffic: 0,
+		works:        0,
+		interval:     0,
+		rates:        0,
+		referer:      "None",
+		headers:      "None",
+		cookies:      "None",
+		postData:     "None",
+		proxyType:    "None",
+		uaType:       "None",
+		bypassType:   "None",
+		// Initialize counter values
+		targetCount:    0,
+		requestOK:      0,
+		requestFail:    0,
+		proxyCount:     0,
+		proxyReqOK:     0,
+		proxyReqFail:   0,
+		proxyBandwidth: 0, // Initialize proxy bandwidth to 0
+		// Set default layout settings
+		rowSpacing: 1, // Default row spacing
+		// Initialize UI configuration
+		uiConfig: NewUIConfig(),
+	}
+
+	// Try to load saved configuration if exists
+	if err := d.LoadUIConfig(); err != nil {
+		fmt.Printf("[Dashboard] No saved config found, using default: %v\n", err)
+	}
+
+	// Initialize all UI components
+	d.initializeComponents()
+
+	fmt.Println("[Dashboard] Initialized with default values")
+
+	return d, nil
+}
+
+// SetJobParams sets all job parameters at once
+func (d *Dashboard) SetJobParams(works, interval, rates int, referer, headers, cookies, postData, proxyType, uaType, bypassType string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.works = works
+	d.interval = interval
+	d.rates = rates
+
+	if referer != "" {
+		d.referer = referer
+	}
+
+	if headers != "" {
+		d.headers = headers
+	}
+
+	if cookies != "" {
+		d.cookies = cookies
+	}
+
+	if postData != "" {
+		d.postData = postData
+	}
+
+	if proxyType != "" {
+		d.proxyType = proxyType
+	}
+
+	if uaType != "" {
+		d.uaType = uaType
+	}
+
+	if bypassType != "" {
+		d.bypassType = bypassType
+	}
+
+	fmt.Printf("[Dashboard] Job parameters set: works=%d, interval=%d, rates=%d, proxyType=%s\n",
+		d.works, d.interval, d.rates, d.proxyType)
+}
+
+func (d *Dashboard) initializeComponents() {
+	// Header section
+	d.headerBox = widgets.NewParagraph()
+	d.headerBox.Title = "HTTP Stress Tool v1.0"
+	d.headerBox.BorderStyle.Fg = termui.ColorRed
+	d.headerBox.TextStyle = termui.NewStyle(termui.ColorGreen)
+	d.headerBox.TitleStyle = termui.NewStyle(termui.ColorWhite, termui.ColorClear, termui.ModifierBold)
+
+	// Job info section
+	d.jobInfoBox = widgets.NewParagraph()
+	d.jobInfoBox.Title = "Job Info"
+	d.jobInfoBox.BorderStyle.Fg = termui.ColorRed
+	d.jobInfoBox.TextStyle = termui.NewStyle(termui.ColorGreen)
+	d.jobInfoBox.TitleStyle = termui.NewStyle(termui.ColorWhite, termui.ColorClear, termui.ModifierBold)
+
+	// 拆分Counts区域为两个独立区域
+	// 目标请求统计
+	d.targetCountsBox = widgets.NewParagraph()
+	d.targetCountsBox.Title = "Target Requests"
+	d.targetCountsBox.BorderStyle.Fg = termui.ColorRed
+	d.targetCountsBox.TextStyle = termui.NewStyle(termui.ColorGreen)
+	d.targetCountsBox.TitleStyle = termui.NewStyle(termui.ColorWhite, termui.ColorClear, termui.ModifierBold)
+
+	// 代理请求统计
+	d.proxyCountsBox = widgets.NewParagraph()
+	d.proxyCountsBox.Title = "Proxy Requests"
+	d.proxyCountsBox.BorderStyle.Fg = termui.ColorRed
+	d.proxyCountsBox.TextStyle = termui.NewStyle(termui.ColorGreen)
+	d.proxyCountsBox.TitleStyle = termui.NewStyle(termui.ColorWhite, termui.ColorClear, termui.ModifierBold)
+
+	// 网络数据统计
+	d.networkStatsBox = widgets.NewParagraph()
+	d.networkStatsBox.Title = "Network Stats"
+	d.networkStatsBox.BorderStyle.Fg = termui.ColorRed
+	d.networkStatsBox.TextStyle = termui.NewStyle(termui.ColorGreen)
+	d.networkStatsBox.TitleStyle = termui.NewStyle(termui.ColorWhite, termui.ColorClear, termui.ModifierBold)
+
+	// OS stats section - 修改为水平布局
+	d.cpuGauge = widgets.NewGauge()
+	d.cpuGauge.Title = " CPU "
+	d.cpuGauge.TitleStyle = termui.NewStyle(termui.ColorWhite, termui.ColorClear, termui.ModifierBold)
+	d.cpuGauge.BarColor = termui.ColorRed
+	d.cpuGauge.BorderStyle.Fg = termui.ColorRed
+	d.cpuGauge.LabelStyle = termui.NewStyle(termui.ColorGreen)
+
+	d.memGauge = widgets.NewGauge()
+	d.memGauge.Title = " MEM "
+	d.memGauge.TitleStyle = termui.NewStyle(termui.ColorWhite, termui.ColorClear, termui.ModifierBold)
+	d.memGauge.BarColor = termui.ColorYellow
+	d.memGauge.BorderStyle.Fg = termui.ColorRed
+	d.memGauge.LabelStyle = termui.NewStyle(termui.ColorGreen)
+
+	d.gcGauge = widgets.NewGauge()
+	d.gcGauge.Title = " GC "
+	d.gcGauge.TitleStyle = termui.NewStyle(termui.ColorWhite, termui.ColorClear, termui.ModifierBold)
+	d.gcGauge.BarColor = termui.ColorGreen
+	d.gcGauge.BorderStyle.Fg = termui.ColorRed
+	d.gcGauge.LabelStyle = termui.NewStyle(termui.ColorGreen)
+
+	// Charts
+	d.rpsChart = widgets.NewPlot()
+	d.rpsChart.Title = "Requests Per Second"
+	d.rpsChart.LineColors = []termui.Color{termui.ColorGreen}
+	d.rpsChart.AxesColor = termui.ColorWhite
+	d.rpsChart.BorderStyle.Fg = termui.ColorRed
+	d.rpsChart.DrawDirection = widgets.DrawLeft
+	d.rpsChart.Data = [][]float64{d.currentRPS}
+	d.rpsChart.PlotType = widgets.LineChart
+	d.rpsChart.TitleStyle = termui.NewStyle(termui.ColorWhite, termui.ColorClear, termui.ModifierBold)
+	d.rpsChart.MaxVal = 100 // Set initial max value
+
+	d.responseChart = widgets.NewPlot()
+	d.responseChart.Title = "Response Time (ms)"
+	d.responseChart.LineColors = []termui.Color{termui.ColorCyan}
+	d.responseChart.AxesColor = termui.ColorWhite
+	d.responseChart.BorderStyle.Fg = termui.ColorRed
+	d.responseChart.DrawDirection = widgets.DrawLeft
+	d.responseChart.Data = [][]float64{d.currentResponseTime}
+	d.responseChart.PlotType = widgets.LineChart
+	d.responseChart.TitleStyle = termui.NewStyle(termui.ColorWhite, termui.ColorClear, termui.ModifierBold)
+	d.responseChart.MaxVal = 1000 // Set initial max value
+
+	// Response codes bar chart
+	d.responseCodes = widgets.NewBarChart()
+	d.responseCodes.Title = "Response Codes"
+	d.responseCodes.BarColors = []termui.Color{
+		termui.ColorGreen,  // 200
+		termui.ColorYellow, // 301
+		termui.ColorYellow, // 302
+		termui.ColorRed,    // 403
+		termui.ColorYellow, // 404
+		termui.ColorRed,    // More
+	}
+	d.responseCodes.NumStyles = []termui.Style{
+		termui.NewStyle(termui.ColorWhite),
+		termui.NewStyle(termui.ColorWhite),
+		termui.NewStyle(termui.ColorWhite),
+		termui.NewStyle(termui.ColorWhite),
+		termui.NewStyle(termui.ColorWhite),
+		termui.NewStyle(termui.ColorWhite),
+	}
+	d.responseCodes.BorderStyle.Fg = termui.ColorRed
+	d.responseCodes.TitleStyle = termui.NewStyle(termui.ColorWhite, termui.ColorClear, termui.ModifierBold)
+	d.responseCodes.LabelStyles = []termui.Style{
+		termui.NewStyle(termui.ColorGreen),
+	}
+
+	// Server IPs 文本展示 - 改用段落组件
+	d.serverIPs = widgets.NewParagraph()
+	d.serverIPs.Title = "Server IP Distribution"
+	d.serverIPs.BorderStyle.Fg = termui.ColorRed
+	d.serverIPs.TitleStyle = termui.NewStyle(termui.ColorWhite, termui.ColorClear, termui.ModifierBold)
+	d.serverIPs.TextStyle = termui.NewStyle(termui.ColorGreen)
+	d.serverIPs.Text = "Waiting for data..."
+
+	// 初始化IP统计map
+	d.serverIPStats = make(map[string]int64)
+
+	// Request table
+	d.requestTable = widgets.NewTable()
+	d.requestTable.Title = "Last Requests (10)"
+	d.requestTable.TextStyle = termui.NewStyle(termui.ColorGreen)
+	d.requestTable.BorderStyle.Fg = termui.ColorRed
+	d.requestTable.TitleStyle = termui.NewStyle(termui.ColorWhite, termui.ColorClear, termui.ModifierBold)
+	d.requestTable.RowSeparator = true
+	d.requestTable.FillRow = true
+	d.requestTable.Rows = [][]string{
+		{"Time", "Current Proxy", "URL", "Response Code/Time/BodySize", "Response Server/IP"},
+	}
+	d.requestTable.RowStyles[0] = termui.NewStyle(termui.ColorGreen, termui.ColorClear, termui.ModifierBold)
+}
+
+// Start starts the dashboard
+func (d *Dashboard) Start() error {
+	fmt.Println("[Dashboard] Starting dashboard")
+
+	// 确保所有组件都已正确初始化
+	if d.rpsChart == nil || d.responseChart == nil || d.responseCodes == nil ||
+		d.headerBox == nil || d.jobInfoBox == nil || d.targetCountsBox == nil || d.proxyCountsBox == nil ||
+		d.cpuGauge == nil || d.memGauge == nil || d.gcGauge == nil {
+		fmt.Println("[Dashboard] Re-initializing components")
+		d.initializeComponents()
+	}
+
+	// 确保配置正确初始化
+	fmt.Printf("[Dashboard] Initial values: targetURL=%s, attackMode=%s, attackTime=%d\n",
+		d.targetURL, d.attackMode, d.attackTime)
+	fmt.Printf("[Dashboard] Initial counts: targetCount=%d, requestOK=%d, requestFail=%d\n",
+		d.targetCount, d.requestOK, d.requestFail)
+
+	// 如果攻击时间大于0，设置倒计时
+	if d.attackTime > 0 {
+		d.timeLeft = d.attackTime
+		fmt.Printf("[Dashboard] Attack will finish in %d seconds\n", d.timeLeft)
+	}
+
+	// 如果stats为空，初始化它
+	if d.stats == nil {
+		d.stats = &Stats{
+			Start:               time.Now(),
+			Codes:               make(map[int]int64),
+			Errors:              make(map[string]int),
+			LatencyDistribution: make(map[int64]int64),
+		}
+	}
+
+	// 使用硬编码数据进行初始化
+	d.updateWithHardcodedData()
+	fmt.Println("[Dashboard] Set hardcoded test data")
+
+	// 更新网络统计和计数等显示
+	d.updateNetworkStats()
+	d.updateCounts()
+
+	// 初始渲染
+	termui.Clear()
+	fmt.Println("[Dashboard] First render")
+	d.render()
+	fmt.Println("[Dashboard] Initial render complete")
+
+	// 启动UI更新循环
+	go d.updateUI()
+	fmt.Println("[Dashboard] Started UI update loop")
+
+	// 启动事件处理循环
+	go d.handleEvents()
+	fmt.Println("[Dashboard] Started event handling")
+
+	// 等待结束信号
+	fmt.Println("[Dashboard] Waiting for termination signal")
+	<-d.done
+
+	fmt.Println("[Dashboard] Dashboard terminated")
+	return nil
+}
+
+// Stop stops the dashboard
+func (d *Dashboard) Stop() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if !d.stopped {
+		d.stopped = true
+		close(d.done)
+		termui.Close()
+
+		// 在标准方法之后，添加额外的终端清理
+		// 重置终端状态，避免退出后显示乱码
+		fmt.Print("\033[H\033[2J") // 清屏
+		fmt.Print("\033[?25h")     // 显示光标
+		fmt.Print("\033[0m")       // 重置所有属性
+		fmt.Println()              // 输出一个空行，确保提示符正确显示
+	}
+}
+
+// render updates the layout and renders all components
+			// 直接退出程序
+			os.Exit(0)
+		}
+	}()
+
+	// 禁用标准错误输出
+	if f, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0644); err == nil {
+		defer f.Close()
+		// 临时重定向标准错误到空设备
+		oldStderr := os.Stderr
+		os.Stderr = f
+
+		// 在函数结束时恢复标准错误
+		defer func() {
+			os.Stderr = oldStderr
+		}()
+	}
+
+	// 获取终端尺寸
+	termWidth, termHeight := termui.TerminalDimensions()
+
+	// 计算对话框尺寸和位置（居中）
+	dialogWidth := 40
+	dialogHeight := 6
+	x := (termWidth - dialogWidth) / 2
+	y := (termHeight - dialogHeight) / 2
+
+	// 创建完成对话框
+	dialog := widgets.NewParagraph()
+	dialog.Title = "[ 攻击已完成 ]"
+	dialog.BorderStyle.Fg = termui.ColorGreen
+	dialog.TitleStyle = termui.NewStyle(termui.ColorYellow, termui.ColorClear, termui.ModifierBold)
+	dialog.TextStyle = termui.NewStyle(termui.ColorWhite)
+
+	// 设置对话框文本内容
+	dialog.Text = "\n\n     攻击任务已完成，程序将在3秒后自动退出     \n     或按任意键立即退出     "
+
+	// 设置对话框位置
+	dialog.SetRect(x, y, x+dialogWidth, y+dialogHeight)
+
+	// 安全地渲染对话框，使用单独的渲染调用
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// 忽略渲染错误，不输出任何信息
+				return
+			}
+		}()
+
+		// 创建一个临时的UI，覆盖当前屏幕
+		termui.Clear()
+		termui.Render(dialog)
+	}()
+
+	// 设置自动退出定时器
+	exitTimer := time.NewTimer(3 * time.Second)
+
+	// 同时设置一个捕获按键的goroutine，让用户可以主动按键退出
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// 忽略错误，直接退出程序
+				cleanupTerminal()
+				os.Exit(0)
+			}
+		}()
+
+		// 捕获事件
+		uiEvents := termui.PollEvents()
+
+		select {
+		case <-uiEvents:
+			// 用户按键退出
+			exitTimer.Stop()
+			// 清理终端并退出
+			cleanupTerminal()
+			os.Exit(0)
+		case <-exitTimer.C:
+			// 超时自动退出，清理终端并退出
+			cleanupTerminal()
+			os.Exit(0)
+		}
+	}()
+}
+
+// cleanupTerminal 清理终端，确保退出时没有残留的UI元素
+func cleanupTerminal() {
+	// 首先关闭termui
+	termui.Close()
+	
+	// 重置终端到初始状态
+	fmt.Print("\033[H\033[2J") // 清屏
+	fmt.Print("\033[?25h")     // 显示光标
+	fmt.Print("\033[0m")       // 重置所有属性
+	
+	// 输出一个空行，确保提示符正确显示
+	fmt.Println()
+}
+
+// initTableRows 初始化表格，确保有10行数据
+func (d *Dashboard) initTableRows() {
+	if d.requestTable == nil {
+		d.requestTable = widgets.NewTable()
+		d.requestTable.Title = "Last Requests (10)"
+		d.requestTable.TextStyle = termui.NewStyle(termui.ColorGreen)
+		d.requestTable.BorderStyle.Fg = termui.ColorRed
+		d.requestTable.TitleStyle = termui.NewStyle(termui.ColorWhite, termui.ColorClear, termui.ModifierBold)
+		d.requestTable.RowSeparator = true
+		d.requestTable.FillRow = true
+
+		// Set custom column widths to optimize display
+		d.requestTable.ColumnWidths = []int{12, 50, 25, 22, 22}
+		d.requestTable.ColumnResizer = func() {
+			// Custom column resizer to maintain proportions
+			width := d.requestTable.Inner.Dx()
+			// Calculate column widths based on percentages - give more space to proxy
+			d.requestTable.ColumnWidths = []int{
+				width * 12 / 100, // Time: 17% for full date/time
+				width * 50 / 100, // Current Proxy: ~45% of space
+				width * 20 / 100, // URL: ~20% of space
+				width * 10 / 100, // Response Code: ~10% of space
+				width * 8 / 100,  // Response Server: ~8% of space
+			}
+		}
+	}
+
+	// 确保有表头
+	if len(d.requestTable.Rows) == 0 {
+		d.requestTable.Rows = [][]string{
+			{"Time", "Current Proxy", "URL", "Response Code/Time/BodySize", "Response Server/IP"},
+		}
+		d.requestTable.RowStyles = make(map[int]termui.Style)
+		d.requestTable.RowStyles[0] = termui.NewStyle(termui.ColorGreen, termui.ColorClear, termui.ModifierBold)
+	}
+
+	// 填充10行空数据，确保表格显示完整
+	for i := len(d.requestTable.Rows); i <= 10; i++ {
+		d.requestTable.Rows = append(d.requestTable.Rows, []string{
+			"0000/00/00 00:00:00",
+			"waiting...",
+			"waiting...",
+			"---/---/---",
+			"---/---",
+		})
+	}
+}
+
+// updateServerIPStats 更新服务器IP统计信息
+func (d *Dashboard) updateServerIPStats() {
+	// 确保serverIPs已初始化
+	if d.serverIPs == nil {
+		d.serverIPs = widgets.NewParagraph()
+		d.serverIPs.Title = "Server IP Distribution"
+		d.serverIPs.BorderStyle.Fg = termui.ColorRed
+		d.serverIPs.TitleStyle = termui.NewStyle(termui.ColorWhite, termui.ColorClear, termui.ModifierBold)
+		d.serverIPs.TextStyle = termui.NewStyle(termui.ColorGreen)
+	}
+
+	// 如果IP统计map未初始化，初始化它
+	if d.serverIPStats == nil {
+		d.serverIPStats = make(map[string]int64)
+	}
+
+	// 模拟更新IP统计数据
+	// 注意：在实际应用中，这些数据应来自真实统计
+	ips := []string{
+		"192.168.1.101",
+		"172.16.0.254",
+		"104.16.132.229",
+		"13.225.78.102",
+		"9.204.177.102",
+	}
+
+	// 更新IP计数
+	for _, ip := range ips {
+		randomIncrement := rand.Int63n(5) + 1 // 增加1-5次计数
+		d.serverIPStats[ip] += randomIncrement
+	}
+
+	// 将map转换为排序后的数据
+	type ipCount struct {
+		ip    string
+		count int64
+	}
+	var sortedIPs []ipCount
+	for ip, count := range d.serverIPStats {
+		sortedIPs = append(sortedIPs, ipCount{ip, count})
+	}
+
+	// 按计数降序排序
+	sort.Slice(sortedIPs, func(i, j int) bool {
+		return sortedIPs[i].count > sortedIPs[j].count
+	})
+
+	// 仅保留前10个IP，以避免显示过多
+	if len(sortedIPs) > 10 {
+		sortedIPs = sortedIPs[:10]
+	}
+
+	// 生成文本展示
+	if len(sortedIPs) == 0 {
+		d.serverIPs.Text = "No data available"
+		return
+	}
+
+	// 为每行分配5个IP，使用不同颜色
+	var lines []string
+	line := ""
+	for i, item := range sortedIPs {
+		// 添加IP和计数，轮换使用不同颜色
+		var ipInfo string
+		switch i % 4 {
+		case 0:
+			ipInfo = fmt.Sprintf("[%s](fg:green,mod:bold)([%d](fg:white))", item.ip, item.count)
+		case 1:
+			ipInfo = fmt.Sprintf("[%s](fg:green,mod:bold)([%d](fg:white))", item.ip, item.count)
+		case 2:
+			ipInfo = fmt.Sprintf("[%s](fg:green,mod:bold)([%d](fg:white))", item.ip, item.count)
+		case 3:
+			ipInfo = fmt.Sprintf("[%s](fg:green,mod:bold)([%d](fg:white))", item.ip, item.count)
+		}
+
+		// 如果不是第一个IP，添加分隔符
+		if i%5 != 0 {
+			line += " [|](fg:red,mod:bold) "
+		} else if i > 0 {
+			// 如果是新的一行，将前一行添加到lines中
+			lines = append(lines, line)
+			line = ""
+		}
+
+		line += ipInfo
+	}
+
+	// 添加最后一行
+	if line != "" {
+		lines = append(lines, line)
+	}
+
+	// 合并所有行
+	d.serverIPs.Text = strings.Join(lines, "\n")
+}
+
+// updateRequestTable 更新请求表格
+func (d *Dashboard) updateRequestTable() {
+	// 确保requestTable已初始化
+	if d.requestTable == nil || len(d.requestTable.Rows) == 0 {
+		d.initTableRows()
+	}
+
+	// 生成一个新的请求行
+	timeStr := time.Now().Format("2006/01/02 15:04:05") // Full date and time format
+
+	// 随机生成代理信息 - 注意使用更真实的表示
+	proxyTypes := []string{"http", "socks5", "socks4", "direct"}
+	proxyIdx := rand.Intn(len(proxyTypes))
+	var proxyStr string
+	if proxyTypes[proxyIdx] == "direct" {
+		proxyStr = "direct"
+	} else {
+		proxyStr = fmt.Sprintf("%s://proxy-%d.example.com", proxyTypes[proxyIdx], rand.Intn(100))
+	}
+
+	// 随机生成路径和查询参数
+	paths := []string{"/", "/api", "/login", "/images", "/static"}
+	queries := []string{"", "?id=123", "?page=1&size=10", "?user=admin", "?token=xyz"}
+	pathIdx := rand.Intn(len(paths))
+	queryIdx := rand.Intn(len(queries))
+	urlStr := fmt.Sprintf("http://waf.witercloud.com%s%s", paths[pathIdx], queries[queryIdx])
+
+	// 随机响应码
+	codes := []int{200, 301, 302, 400, 403, 404, 500, 502, 503}
+	codeIdx := rand.Intn(len(codes))
+	code := codes[codeIdx]
+
+	// 随机延迟和大小
+	latency := 50 + rand.Intn(200)
+	size := 512 + rand.Intn(2048)
+
+	respInfo := fmt.Sprintf("%d/%dms/%d", code, latency, size)
+
+	// 随机服务器和IP，确保使用在ServerIPStats中跟踪的IP
+	servers := []string{"nginx", "apache", "iis", "cloudflare", "openresty"}
+	serverIdx := rand.Intn(len(servers))
+
+	// 尝试使用追踪的IP之一
+	var ipStr string
+	if len(d.serverIPStats) > 0 {
+		// 从serverIPStats中随机选择一个IP
+		ipKeys := make([]string, 0, len(d.serverIPStats))
+		for k := range d.serverIPStats {
+			ipKeys = append(ipKeys, k)
+		}
+		ipStr = ipKeys[rand.Intn(len(ipKeys))]
+
+		// 增加此IP的计数
+		d.serverIPStats[ipStr]++
+	} else {
+		// 如果没有跟踪的IP，生成一个随机IP
+		ip1 := rand.Intn(254) + 1
+		ip2 := rand.Intn(254) + 1
+		ip3 := rand.Intn(254) + 1
+		ip4 := rand.Intn(254) + 1
+		ipStr = fmt.Sprintf("%d.%d.%d.%d", ip1, ip2, ip3, ip4)
+
+		// 将其添加到跟踪的IP中
+		d.serverIPStats[ipStr] = 1
+	}
+
+	serverInfo := fmt.Sprintf("%s/%s", servers[serverIdx], ipStr)
+
+	// 新行
+	newRow := []string{timeStr, proxyStr, urlStr, respInfo, serverInfo}
+
+	// 插入到表格的第二行（保留表头）
+	if len(d.requestTable.Rows) > 1 {
+		d.requestTable.Rows = append(d.requestTable.Rows[:1], append([][]string{newRow}, d.requestTable.Rows[1:]...)...)
+	} else {
+		d.requestTable.Rows = append(d.requestTable.Rows, newRow)
+	}
+
+	// 保持最多11行（包括表头）
+	if len(d.requestTable.Rows) > 11 {
+		d.requestTable.Rows = d.requestTable.Rows[:11]
+	}
+
+	// 确保表头使用绿色样式
+	d.requestTable.RowStyles[0] = termui.NewStyle(termui.ColorGreen, termui.ColorClear, termui.ModifierBold)
+}
+
+// updateHeader updates the header section with current information
+func (d *Dashboard) updateHeader() {
+	// 计算倒计时显示
+	var timeDisplay string
+	if d.attackTime > 0 {
+		if d.timeLeft <= 0 {
+			timeDisplay = "[已完成](fg:green,mod:bold)"
+		} else {
+			timeDisplay = fmt.Sprintf("[%d秒](fg:yellow,mod:bold)", d.timeLeft)
+		}
+	} else {
+		timeDisplay = "[持续运行](fg:blue)"
+	}
+
+	// 计算执行时间
+	execTime := time.Since(d.stats.Start).Seconds()
+
+	// 格式化带宽和流量
+	var bwStr, trafficStr string
+	if d.bandwidth > 0 {
+		bwStr = fmt.Sprintf("%.2f Mbps", d.bandwidth)
+	} else {
+		bwStr = "0 Mbps"
+	}
+
+	if d.totalTraffic > 0 {
+		trafficStr = fmt.Sprintf("%.2f GB", d.totalTraffic)
+	} else {
+		trafficStr = "0 GB"
+	}
+
+	// Format the header to clearly display all important information
+	d.headerBox.Text = fmt.Sprintf(
+		"[目标:](fg:white,mod:bold) [%s](fg:green,mod:bold)  [模式:](fg:white,mod:bold) [%s](fg:green,mod:bold)\n"+
+			"[攻击时间:](fg:white,mod:bold) [%d秒](fg:green,mod:bold)  [剩余:](fg:white,mod:bold) %s  [运行:](fg:white,mod:bold) [%.1f秒](fg:green,mod:bold)\n"+
+			"[带宽:](fg:white,mod:bold) [%s](fg:green,mod:bold)  [总流量:](fg:white,mod:bold) [%s](fg:green,mod:bold)",
+		d.targetURL,
+		d.attackMode,
+		d.attackTime,
+		timeDisplay,
+		execTime,
+		bwStr,
+		trafficStr,
+	)
+}
+
+func (d *Dashboard) updateJobInfo() {
+	// Format headers and other long strings to prevent UI overflow
+	refererDisplay := formatLongString(d.referer, 30)
+
+	// Build job info text with proper formatting and ensure all parameters are displayed
+	d.jobInfoBox.Text = fmt.Sprintf(
+		"[Works:](fg:white,mod:bold) [%d](fg:green,mod:bold)  [Workers]\n"+
+			"[Interval:](fg:white,mod:bold) [%d](fg:green,mod:bold)  [ms]\n"+
+			"[Rates:](fg:white,mod:bold) [%d](fg:green,mod:bold)  [requests/sec]\n"+
+			"[Proxy Type:](fg:white,mod:bold) [%s](fg:yellow,mod:bold)\n"+
+			"[UA Type:](fg:white,mod:bold) [%s](fg:green)\n"+
+			"[Bypass:](fg:white,mod:bold) [%s](fg:green)\n"+
+			"[Referer:](fg:white,mod:bold) [%s](fg:green)",
+		d.works, d.interval, d.rates, d.proxyType,
+		d.uaType, d.bypassType, refererDisplay,
+	)
+}
+
+// formatLongString truncates and formats long strings for display
+func formatLongString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
+}
+
+// updateCounts 更新计数显示，拆分为两个独立区域
+func (d *Dashboard) updateCounts() {
+	// 调试输出
+	fmt.Printf("[Dashboard] updateCounts: targetCount=%d, requestOK=%d, requestFail=%d\n",
+		d.targetCount, d.requestOK, d.requestFail)
+
+	// 确保targetCountsBox已初始化
+	if d.targetCountsBox == nil {
+		d.targetCountsBox = widgets.NewParagraph()
+		d.targetCountsBox.Title = "Target Requests"
+		d.targetCountsBox.BorderStyle.Fg = termui.ColorRed
+		d.targetCountsBox.TextStyle = termui.NewStyle(termui.ColorGreen)
+		d.targetCountsBox.TitleStyle = termui.NewStyle(termui.ColorWhite, termui.ColorClear, termui.ModifierBold)
+	}
+
+	// 确保proxyCountsBox已初始化
+	if d.proxyCountsBox == nil {
+		d.proxyCountsBox = widgets.NewParagraph()
+		d.proxyCountsBox.Title = "Proxy Requests"
+		d.proxyCountsBox.BorderStyle.Fg = termui.ColorRed
+		d.proxyCountsBox.TextStyle = termui.NewStyle(termui.ColorGreen)
+		d.proxyCountsBox.TitleStyle = termui.NewStyle(termui.ColorWhite, termui.ColorClear, termui.ModifierBold)
+	}
+
+	// 更新目标请求统计
+	d.targetCountsBox.Text = fmt.Sprintf(
+		"[Target Statistics](fg:white,mod:bold)\n"+
+			"[Total Requests:](fg:white) [%d](fg:green,mod:bold)\n"+
+			"[Success:](fg:white) [%d](fg:green,mod:bold)\n"+
+			"[Failed:](fg:white) [%d](fg:red,mod:bold)",
+		d.targetCount, d.requestOK, d.requestFail,
+	)
+
+	// 更新代理请求统计
+	proxyModeInfo := ""
+	if d.proxyType != "none" && d.proxyType != "" {
+		proxyModeInfo = fmt.Sprintf(" - [%s](fg:yellow)", d.proxyType)
+	}
+
+	d.proxyCountsBox.Text = fmt.Sprintf(
+		"[Proxy Statistics](fg:white,mod:bold)%s\n"+
+			"[Total Proxies:](fg:white) [%d](fg:green,mod:bold)\n"+
+			"[Success:](fg:white) [%d](fg:green,mod:bold)\n"+
+			"[Failed:](fg:white) [%d](fg:red,mod:bold)",
+		proxyModeInfo, d.proxyCount, d.proxyReqOK, d.proxyReqFail,
+	)
+}
+
+func (d *Dashboard) updateOSStats() {
+	d.cpuGauge.Percent = int(d.cpuUsage * 100)
+	d.memGauge.Percent = int(d.memUsage * 100)
+	d.gcGauge.Percent = int(d.gcUsage * 100)
+
+	// Update gauge labels - 显示更简洁的标签
+	d.cpuGauge.Label = fmt.Sprintf("%.1f%%", d.cpuUsage*100)
+	d.memGauge.Label = fmt.Sprintf("%.1f%%", d.memUsage*100)
+	d.gcGauge.Label = fmt.Sprintf("%.1f%%", d.gcUsage*100)
+}
+
+// updateCharts updates all charts with new data
+func (d *Dashboard) updateCharts() {
+	// Update RPS chart
+	if len(d.currentRPS) > 0 {
+		// Ensure we have at least 2 points
+		if len(d.currentRPS) < 2 {
+			d.currentRPS = append(d.currentRPS, d.currentRPS[0])
+		}
+		d.rpsChart.Data = [][]float64{d.currentRPS}
+		currentRPS := d.currentRPS[len(d.currentRPS)-1]
+		d.rpsChart.Title = fmt.Sprintf(" RPS (Current: %.2f) ", currentRPS)
+
+		// Dynamically adjust max value
+		maxRPS := float64(0)
+		for _, v := range d.currentRPS {
+			if v > maxRPS {
+				maxRPS = v
+			}
+		}
+		d.rpsChart.MaxVal = maxRPS * 1.2 // Add 20% headroom
+		if d.rpsChart.MaxVal <= 0 {
+			d.rpsChart.MaxVal = 1.0 // 确保MaxVal至少为1.0
+		}
+	}
+
+	// Update response time chart
+	if len(d.currentResponseTime) > 0 {
+		// Ensure we have at least 2 points
+		if len(d.currentResponseTime) < 2 {
+			d.currentResponseTime = append(d.currentResponseTime, d.currentResponseTime[0])
+		}
+		d.responseChart.Data = [][]float64{d.currentResponseTime}
+		currentRT := d.currentResponseTime[len(d.currentResponseTime)-1]
+		d.responseChart.Title = fmt.Sprintf(" Response Time (Current: %.2fms) ", currentRT)
+
+		// Dynamically adjust max value
+		maxRT := float64(0)
+		for _, v := range d.currentResponseTime {
+			if v > maxRT {
+				maxRT = v
+			}
+		}
+		d.responseChart.MaxVal = maxRT * 1.2 // Add 20% headroom
+		if d.responseChart.MaxVal <= 0 {
+			d.responseChart.MaxVal = 1.0 // 确保MaxVal至少为1.0
+		}
+	}
+
+	// Update response codes chart with data from stats
+	if d.stats != nil && d.responseCodes != nil {
+		// 确保responseCodes已正确初始化
+		if d.responseCodes == nil {
+			d.responseCodes = widgets.NewBarChart()
+			d.responseCodes.Title = "Response Codes"
+			d.responseCodes.BorderStyle.Fg = termui.ColorRed
+			d.responseCodes.TitleStyle = termui.NewStyle(termui.ColorWhite, termui.ColorClear, termui.ModifierBold)
+		}
+
+		d.stats.Mu.RLock()
+
+		// Convert map to sorted slice of codes and counts
+		var codes []int
+		for code := range d.stats.Codes {
+			codes = append(codes, code)
+		}
+		// Sort codes for consistent display
+		sort.Ints(codes)
+
+		// Prepare data and labels
+		var data []float64
+		var labels []string
+		for _, code := range codes {
+			data = append(data, float64(d.stats.Codes[code]))
+			labels = append(labels, strconv.Itoa(code))
+		}
+		d.stats.Mu.RUnlock()
+
+		// 如果没有数据，添加一个默认值
+		if len(data) == 0 {
+			data = []float64{0}
+			labels = []string{"No Data"}
+		}
+
+		// 设置图表数据和标签
+		d.responseCodes.Data = data
+		d.responseCodes.Labels = labels
+
+		// 动态调整颜色
+		colors := make([]termui.Color, len(labels))
+		numStyles := make([]termui.Style, len(labels))
+
+		for i, label := range labels {
+			code, err := strconv.Atoi(label)
+			if err == nil {
+				// 根据HTTP状态码分配颜色
+				switch {
+				case code >= 200 && code < 300:
+					colors[i] = termui.ColorGreen // 2xx 成功
+				case code >= 300 && code < 400:
+					colors[i] = termui.ColorYellow // 3xx 重定向
+				case code >= 400 && code < 500:
+					colors[i] = termui.ColorRed // 4xx 客户端错误
+				case code >= 500:
+					colors[i] = termui.ColorMagenta // 5xx 服务器错误
+				default:
+					colors[i] = termui.ColorBlue
+				}
+			} else {
+				// 不是数字标签（如"No Data"）
+				colors[i] = termui.ColorBlue
+			}
+
+			// 设置数字样式
+			numStyles[i] = termui.NewStyle(termui.ColorWhite)
+		}
+
+		// 应用颜色和样式
+		d.responseCodes.BarColors = colors
+		d.responseCodes.NumStyles = numStyles
+
+		// 设置标签样式，确保所有标签都有样式
+		labelStyles := make([]termui.Style, len(labels))
+		for i := range labels {
+			labelStyles[i] = termui.NewStyle(termui.ColorWhite)
+		}
+		d.responseCodes.LabelStyles = labelStyles
+	}
+
+	// Limit data points for performance
+	maxPoints := 100
+	if len(d.currentRPS) > maxPoints {
+		d.currentRPS = d.currentRPS[len(d.currentRPS)-maxPoints:]
+	}
+	if len(d.currentResponseTime) > maxPoints {
+		d.currentResponseTime = d.currentResponseTime[len(d.currentResponseTime)-maxPoints:]
+	}
+}
+
+// SetTarget sets the target URL
+func (d *Dashboard) SetTarget(url string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.targetURL = url
+}
+
+// SetMode sets the attack mode
+func (d *Dashboard) SetMode(mode string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.attackMode = mode
+}
+
+// SetDuration sets the attack duration
+func (d *Dashboard) SetDuration(seconds int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.attackTime = seconds
+	d.timeLeft = seconds
+}
+
+// UpdateStats updates all statistics
+func (d *Dashboard) UpdateStats(stats interface{}) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	fmt.Println("[Dashboard] UpdateStats called with stats:", stats)
+
+	// 如果没有传入数据，使用硬编码数据
+	if stats == nil {
+		fmt.Println("[Dashboard] Stats is nil, using hardcoded data")
+		d.updateWithHardcodedData()
+		return
+	}
+
+	// 尝试将stats转换为map[string]interface{}
+	statsMap, ok := stats.(map[string]interface{})
+	if !ok {
+		fmt.Printf("[Dashboard] Stats is not a map, got type %T, trying to convert\n", stats)
+
+		// 尝试使用类型断言转换不同类型的stats
+		if statsStruct, ok := stats.(*Stats); ok {
+			// 如果传入的是Stats结构体，则创建等效的Map
+			statsMap = make(map[string]interface{})
+			statsMap["totalRequests"] = statsStruct.Total
+			statsMap["requestOK"] = statsStruct.Success
+			statsMap["requestFail"] = statsStruct.Failed
+			statsMap["codes"] = statsStruct.Codes
+
+			// 计算带宽和流量
+			if statsStruct.BytesSent > 0 || statsStruct.BytesReceived > 0 {
+				totalBytes := statsStruct.BytesSent + statsStruct.BytesReceived
+				// 计算GB单位的流量
+				statsMap["totalTraffic"] = float64(totalBytes) / (1024 * 1024 * 1024)
+
+				// 计算Mbps单位的带宽 (正确公式: 比特数/时间秒数/1024/1024)
+				durationSeconds := time.Since(statsStruct.Start).Seconds()
+				if durationSeconds > 0 {
+					// 字节数x8转换为比特数，再除以时间和单位换算得到Mbps
+					mbps := (float64(totalBytes) * 8.0) / (durationSeconds * 1024.0 * 1024.0)
+					statsMap["bandwidth"] = mbps
+
+					// 假设代理带宽是总带宽的一定比例（根据实际情况调整）
+					proxyRatio := 0.6 // 60%的流量通过代理
+					// 如果有代理请求，根据实际比例计算
+					if statsStruct.Total > 0 {
+						proxyRequestRatio := float64(statsStruct.Success-statsStruct.Failed) / float64(statsStruct.Total)
+						if proxyRequestRatio > 0 {
+							proxyRatio = proxyRequestRatio
+						}
+					}
+
+					statsMap["proxyBandwidth"] = mbps * proxyRatio
+
+					// 计算上传和下载速度
+					uploadRatio := 0.3 // 默认上传占30%
+					if statsStruct.BytesSent > 0 && totalBytes > 0 {
+						uploadRatio = float64(statsStruct.BytesSent) / float64(totalBytes)
+					}
+
+					statsMap["uploadSpeed"] = mbps * uploadRatio
+					statsMap["downloadSpeed"] = mbps * (1.0 - uploadRatio)
+
+					fmt.Printf("[Dashboard] 计算实时带宽: 总字节=%d, 持续时间=%.2f秒, 带宽=%.2f Mbps\n",
+						totalBytes, durationSeconds, mbps)
+				}
+			}
+
+			// 如果有延迟数据，计算平均延迟
+			if statsStruct.Total > 0 && statsStruct.TotalLatency > 0 {
+				avgLatency := float64(statsStruct.TotalLatency) / float64(statsStruct.Total)
+				statsMap["responseTime"] = avgLatency
+
+				// 计算RPS
+				durationSeconds := time.Since(statsStruct.Start).Seconds()
+				if durationSeconds > 0 {
+					statsMap["currentRPS"] = float64(statsStruct.Total) / durationSeconds
+				}
+			}
+		} else {
+			fmt.Printf("[Dashboard] Unable to convert stats to a usable format, using hardcoded data\n")
+			d.updateWithHardcodedData()
+			return
+		}
+	}
+
+	fmt.Println("[Dashboard] Successfully processed stats with keys:", getMapKeys(statsMap))
+
+	// 更新命令行参数
+	if val, ok := statsMap["works"]; ok {
+		if v, ok := val.(int); ok {
+			d.works = v
+		} else if v, ok := val.(float64); ok {
+			d.works = int(v)
+		}
+	}
+
+	if val, ok := statsMap["interval"]; ok {
+		if v, ok := val.(int); ok {
+			d.interval = v
+		} else if v, ok := val.(float64); ok {
+			d.interval = int(v)
+		}
+	}
+
+	if val, ok := statsMap["rates"]; ok {
+		if v, ok := val.(int); ok {
+			d.rates = v
+		} else if v, ok := val.(float64); ok {
+			d.rates = int(v)
+		}
+	}
+
+	if val, ok := statsMap["proxyType"]; ok {
+		if v, ok := val.(string); ok {
+			d.proxyType = v
+		}
+	}
+
+	if val, ok := statsMap["uaType"]; ok {
+		if v, ok := val.(string); ok {
+			d.uaType = v
+		}
+	}
+
+	if val, ok := statsMap["bypassType"]; ok {
+		if v, ok := val.(string); ok {
+			d.bypassType = v
+		}
+	}
+
+	// 更新基本统计数据
+	if val, ok := statsMap["totalRequests"]; ok {
+		fmt.Printf("[Dashboard] totalRequests found with value %v (type: %T)\n", val, val)
+		if v, ok := val.(uint64); ok {
+			d.targetCount = int64(v)
+		} else if v, ok := val.(int64); ok {
+			d.targetCount = v
+		} else if v, ok := val.(float64); ok {
+			d.targetCount = int64(v)
+		} else {
+			fmt.Printf("[Dashboard] Cannot convert totalRequests of type %T to int64\n", val)
+		}
+	} else {
+		fmt.Println("[Dashboard] totalRequests not found in stats map")
+	}
+
+	if val, ok := statsMap["requestOK"]; ok {
+		if v, ok := val.(uint64); ok {
+			d.requestOK = int64(v)
+		} else if v, ok := val.(int64); ok {
+			d.requestOK = v
+		} else if v, ok := val.(float64); ok {
+			d.requestOK = int64(v)
+		}
+	}
+
+	if val, ok := statsMap["requestFail"]; ok {
+		if v, ok := val.(uint64); ok {
+			d.requestFail = int64(v)
+		} else if v, ok := val.(int64); ok {
+			d.requestFail = v
+		} else if v, ok := val.(float64); ok {
+			d.requestFail = int64(v)
+		}
+	}
+
+	// 更新代理请求统计
+	if val, ok := statsMap["proxyCount"]; ok {
+		if v, ok := val.(int); ok {
+			d.proxyCount = v
+		} else if v, ok := val.(float64); ok {
+			d.proxyCount = int(v)
+		}
+	}
+
+	if val, ok := statsMap["proxyReqOK"]; ok {
+		if v, ok := val.(int64); ok {
+			d.proxyReqOK = v
+		} else if v, ok := val.(uint64); ok {
+			d.proxyReqOK = int64(v)
+		} else if v, ok := val.(float64); ok {
+			d.proxyReqOK = int64(v)
+		}
+	}
+
+	if val, ok := statsMap["proxyReqFail"]; ok {
+		if v, ok := val.(int64); ok {
+			d.proxyReqFail = v
+		} else if v, ok := val.(uint64); ok {
+			d.proxyReqFail = int64(v)
+		} else if v, ok := val.(float64); ok {
+			d.proxyReqFail = int64(v)
+		}
+	}
+
+	// 更新系统指标
+	if val, ok := statsMap["cpuUsage"]; ok {
+		if v, ok := val.(float64); ok {
+			d.cpuUsage = v
+		} else if v, ok := val.(float32); ok {
+			d.cpuUsage = float64(v)
+		}
+	}
+
+	if val, ok := statsMap["memUsage"]; ok {
+		if v, ok := val.(float64); ok {
+			d.memUsage = v
+		} else if v, ok := val.(float32); ok {
+			d.memUsage = float64(v)
+		}
+	}
+
+	if val, ok := statsMap["gcUsage"]; ok {
+		if v, ok := val.(float64); ok {
+			d.gcUsage = v
+		} else if v, ok := val.(float32); ok {
+			d.gcUsage = float64(v)
+		}
+	}
+
+	if val, ok := statsMap["bandwidth"]; ok {
+		if v, ok := val.(float64); ok {
+			d.bandwidth = v
+		} else if v, ok := val.(float32); ok {
+			d.bandwidth = float64(v)
+		}
+	}
+
+	if val, ok := statsMap["totalTraffic"]; ok {
+		if v, ok := val.(float64); ok {
+			d.totalTraffic = v
+		} else if v, ok := val.(float32); ok {
+			d.totalTraffic = float64(v)
+		}
+	}
+
+	if val, ok := statsMap["proxyBandwidth"]; ok {
+		if v, ok := val.(float64); ok {
+			d.proxyBandwidth = v
+		} else if v, ok := val.(float32); ok {
+			d.proxyBandwidth = float64(v)
+		}
+	}
+
+	// 更新实时指标
+	if val, ok := statsMap["currentRPS"]; ok {
+		if v, ok := val.(float64); ok {
+			d.currentRPS = append(d.currentRPS, v)
+			if len(d.currentRPS) > 100 {
+				d.currentRPS = d.currentRPS[len(d.currentRPS)-100:]
+			}
+		} else if v, ok := val.(float32); ok {
+			d.currentRPS = append(d.currentRPS, float64(v))
+			if len(d.currentRPS) > 100 {
+				d.currentRPS = d.currentRPS[len(d.currentRPS)-100:]
+			}
+		} else if v, ok := val.(int64); ok {
+			d.currentRPS = append(d.currentRPS, float64(v))
+			if len(d.currentRPS) > 100 {
+				d.currentRPS = d.currentRPS[len(d.currentRPS)-100:]
+			}
+		}
+	}
+
+	if val, ok := statsMap["responseTime"]; ok {
+		if v, ok := val.(float64); ok {
+			d.currentResponseTime = append(d.currentResponseTime, v)
+			if len(d.currentResponseTime) > 100 {
+				d.currentResponseTime = d.currentResponseTime[len(d.currentResponseTime)-100:]
+			}
+		} else if v, ok := val.(float32); ok {
+			d.currentResponseTime = append(d.currentResponseTime, float64(v))
+			if len(d.currentResponseTime) > 100 {
+				d.currentResponseTime = d.currentResponseTime[len(d.currentResponseTime)-100:]
+			}
+		} else if v, ok := val.(int64); ok {
+			d.currentResponseTime = append(d.currentResponseTime, float64(v))
+			if len(d.currentResponseTime) > 100 {
+				d.currentResponseTime = d.currentResponseTime[len(d.currentResponseTime)-100:]
+			}
+		}
+	}
+
+	// 处理状态码
+	if val, ok := statsMap["codes"]; ok {
+		// 尝试不同的类型转换
+		if codes, ok := val.(map[int]int64); ok && d.stats != nil {
+			// 直接更新内部状态
+			d.stats.Mu.Lock()
+			d.stats.Codes = codes
+			d.stats.Mu.Unlock()
+
+			updateResponseCodesChart(d, codes)
+		} else if codesMap, ok := val.(map[string]interface{}); ok && d.stats != nil {
+			// 如果是string->interface{}格式，需要转换
+			codes := make(map[int]int64)
+			for codeStr, count := range codesMap {
+				code, err := strconv.Atoi(codeStr)
+				if err != nil {
+					continue
+				}
+
+				if countInt, ok := count.(int64); ok {
+					codes[code] = countInt
+				} else if countFloat, ok := count.(float64); ok {
+					codes[code] = int64(countFloat)
+				} else if countInt, ok := count.(int); ok {
+					codes[code] = int64(countInt)
+				}
+			}
+
+			// 更新内部状态
+			d.stats.Mu.Lock()
+			d.stats.Codes = codes
+			d.stats.Mu.Unlock()
+
+			updateResponseCodesChart(d, codes)
+		} else if codesIface, ok := val.(interface{}); ok {
+			// 尝试使用反射处理其他类型
+			fmt.Printf("[Dashboard] Trying to convert codes of type %T using reflection\n", codesIface)
+		}
+	}
+
+	// 处理服务器信息和IP统计
+	if val, ok := statsMap["servers"]; ok {
+		// 尝试处理不同类型的服务器数据
+		if servers, ok := val.([]map[string]interface{}); ok {
+			// 处理map格式的服务器列表
+			processServerList(d, servers)
+		} else if serverList, ok := val.([]interface{}); ok {
+			// 处理interface{}格式的服务器列表
+			processServerInterfaceList(d, serverList)
+		}
+	}
+
+	// 处理最后一个请求数据（用于表格）
+	if val, ok := statsMap["lastRequest"]; ok {
+		if reqData, ok := val.(map[string]interface{}); ok {
+			updateRequestTableWithData(d, reqData)
+		} else if reqIface, ok := val.(interface{}); ok {
+			// 尝试处理其他类型的请求数据
+			fmt.Printf("[Dashboard] Request data of type %T, trying to adapt\n", reqIface)
+			// 这里可以根据具体类型进行更复杂的转换
+		}
+	}
+
+	// 不需要强制清屏，在updateUI中会定期刷新
+}
+
+// processServerList 处理服务器列表数据
+func processServerList(d *Dashboard, servers []map[string]interface{}) {
+	// 清理旧计数，避免累积过多
+	if len(d.serverIPStats) > 30 {
+		// 保留较高的计数
+		type ipCount struct {
+			ip    string
+			count int64
+		}
+		var counts []ipCount
+		for ip, count := range d.serverIPStats {
+			counts = append(counts, ipCount{ip, count})
+		}
+		sort.Slice(counts, func(i, j int) bool {
+			return counts[i].count > counts[j].count
+		})
+
+		// 重新初始化，只保留前20个高频IP
+		d.serverIPStats = make(map[string]int64)
+		for i := 0; i < 20 && i < len(counts); i++ {
+			d.serverIPStats[counts[i].ip] = counts[i].count
+		}
+	}
+
+	// 更新IP统计
+	for _, server := range servers {
+		if ip, ok := server["ip"].(string); ok {
+			// 增加IP计数
+			d.serverIPStats[ip]++
+		}
+	}
+
+	// 更新IP图表
+	d.updateServerIPStats()
+}
+
+// processServerInterfaceList 处理interface{}类型的服务器列表
+func processServerInterfaceList(d *Dashboard, serverList []interface{}) {
+	for _, serverIface := range serverList {
+		if server, ok := serverIface.(map[string]interface{}); ok {
+			if ip, ok := server["ip"].(string); ok {
+				d.serverIPStats[ip]++
+			}
+		} else if serverStr, ok := serverIface.(string); ok {
+			// 有时服务器数据可能是纯IP字符串
+			d.serverIPStats[serverStr]++
+		}
+	}
+
+	// 更新IP图表
+	d.updateServerIPStats()
+}
+
+// updateResponseCodesChart 更新响应码图表
+func updateResponseCodesChart(d *Dashboard, codes map[int]int64) {
+	// 准备数据和标签
+	var data []float64
+	var labels []string
+
+	// 对代码排序以确保一致的显示
+	var sortedCodes []int
+	for code := range codes {
+		sortedCodes = append(sortedCodes, code)
+	}
+	sort.Ints(sortedCodes)
+
+	for _, code := range sortedCodes {
+		data = append(data, float64(codes[code]))
+		labels = append(labels, fmt.Sprintf("%d", code))
+	}
+
+	// 如果没有数据，添加默认值
+	if len(data) == 0 {
+		data = []float64{0}
+		labels = []string{"No Data"}
+	}
+
+	// 设置图表数据和标签
+	d.responseCodes.Data = data
+	d.responseCodes.Labels = labels
+
+	// 设置颜色和样式
+	colors := make([]termui.Color, len(labels))
+	numStyles := make([]termui.Style, len(labels))
+	labelStyles := make([]termui.Style, len(labels))
+
+	for i, label := range labels {
+		code, err := strconv.Atoi(label)
+		if err == nil {
+			// 根据HTTP状态码分配颜色
+			switch {
+			case code >= 200 && code < 300:
+				colors[i] = termui.ColorGreen // 2xx 成功
+			case code >= 300 && code < 400:
+				colors[i] = termui.ColorYellow // 3xx 重定向
+			case code >= 400 && code < 500:
+				colors[i] = termui.ColorRed // 4xx 客户端错误
+			case code >= 500:
+				colors[i] = termui.ColorMagenta // 5xx 服务器错误
+			default:
+				colors[i] = termui.ColorBlue
+			}
+		} else {
+			// 不是数字标签（如"No Data"）
+			colors[i] = termui.ColorBlue
+		}
+
+		// 设置数字样式
+		numStyles[i] = termui.NewStyle(termui.ColorWhite)
+		// 设置标签样式
+		labelStyles[i] = termui.NewStyle(termui.ColorWhite)
+	}
+
+	// 应用颜色和样式
+	d.responseCodes.BarColors = colors
+	d.responseCodes.NumStyles = numStyles
+	d.responseCodes.LabelStyles = labelStyles
+}
+
+// updateRequestTableWithData 更新请求表格
+func updateRequestTableWithData(d *Dashboard, reqData map[string]interface{}) {
+	// 创建表格行
+	timeStr := time.Now().Format("2006/01/02 15:04:05") // Full date and time format
+
+	// 提取并格式化代理信息
+	var proxy string
+	var ok bool
+	var proxyVal interface{}
+	if proxyVal, ok = reqData["proxy"]; ok {
+		proxy = fmt.Sprintf("%v", proxyVal)
+	} else {
+		proxy = "direct" // 如果没有代理，显示direct
+	}
+
+	// 提取并格式化URL
+	var url string
+	var urlVal interface{}
+	if urlVal, ok = reqData["url"]; ok {
+		url = fmt.Sprintf("%v", urlVal)
+	} else {
+		url = "unknown"
+	}
+
+	// 提取并格式化响应代码、时间和大小
+	var code, latency, size interface{}
+	var codeStr, latencyStr, sizeStr string
+
+	if code, ok = reqData["code"]; ok {
+		codeStr = fmt.Sprintf("%v", code)
+	} else {
+		codeStr = "N/A"
+	}
+
+	if latency, ok = reqData["latency"]; ok {
+		latencyStr = fmt.Sprintf("%vms", latency)
+	} else {
+		latencyStr = "N/A"
+	}
+
+	if size, ok = reqData["size"]; ok {
+		sizeStr = fmt.Sprintf("%v", size)
+	} else {
+		sizeStr = "N/A"
+	}
+
+	respInfo := fmt.Sprintf("%s/%s/%s", codeStr, latencyStr, sizeStr)
+
+	// 提取并格式化服务器信息和IP
+	var server, ip interface{}
+	var serverStr, ipStr string
+
+	if server, ok = reqData["server"]; ok && server != nil && fmt.Sprintf("%v", server) != "" {
+		serverStr = fmt.Sprintf("%v", server)
+	} else {
+		serverStr = "unknown"
+	}
+
+	if ip, ok = reqData["ip"]; ok && ip != nil && fmt.Sprintf("%v", ip) != "" && fmt.Sprintf("%v", ip) != "unknown" {
+		ipStr = fmt.Sprintf("%v", ip)
+
+		// 同时更新IP统计
+		if ipStr != "0.0.0.0" && ipStr != "unknown" {
+			d.serverIPStats[ipStr]++
+		}
+	} else {
+		ipStr = "unknown"
+	}
+
+	// 确保显示格式一致
+	serverInfo := fmt.Sprintf("%s/%s", serverStr, ipStr)
+
+	// 创建新行
+	newRow := []string{timeStr, proxy, url, respInfo, serverInfo}
+
+	// 插入到表格的第二行（保留表头）
+	if len(d.requestTable.Rows) > 1 {
+		d.requestTable.Rows = append(d.requestTable.Rows[:1], append([][]string{newRow}, d.requestTable.Rows[1:]...)...)
+	} else {
+		d.requestTable.Rows = append(d.requestTable.Rows, newRow)
+	}
+
+	// 保持最多10行
+	if len(d.requestTable.Rows) > 11 {
+		d.requestTable.Rows = d.requestTable.Rows[:11]
+	}
+
+	// 确保表头样式正确
+	d.requestTable.RowStyles[0] = termui.NewStyle(termui.ColorGreen, termui.ColorClear, termui.ModifierBold)
+}
+
+// getMapKeys 返回map的所有键
+func getMapKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// updateWithHardcodedData updates UI with hardcoded data for testing
+func (d *Dashboard) updateWithHardcodedData() {
+	// 设置基本值 - 使用简单固定值
+	d.targetURL = "http://example.com/test"
+	d.attackMode = "stress"
+	d.attackTime = 60
+	d.timeLeft = 30
+	d.works = 10
+	d.interval = 0
+	d.rates = 100
+	d.targetCount = 100
+	d.requestOK = 80
+	d.requestFail = 20
+	d.cpuUsage = 0.25
+	d.memUsage = 0.35
+	d.gcUsage = 0.15
+	d.bandwidth = 5.5      // 增加带宽数值，使其更加明显
+	d.totalTraffic = 1.25  // 增加总流量数值
+	d.proxyBandwidth = 3.3 // 设置为带宽的60%左右
+	d.uploadSpeed = 1.65   // 设置上传速度为带宽的30%
+	d.downloadSpeed = 3.85 // 设置下载速度为带宽的70%
+
+	// 输出调试信息
+	fmt.Printf("[Dashboard] Setting hardcoded data: bandwidth=%.2f, proxyBandwidth=%.2f, uploadSpeed=%.2f, downloadSpeed=%.2f\n",
+		d.bandwidth, d.proxyBandwidth, d.uploadSpeed, d.downloadSpeed)
+
+	// 设置代理统计数据
+	d.proxyCount = 10
+	d.proxyReqOK = 60
+	d.proxyReqFail = 10
+	d.proxyType = "file"
+
+	// 设置响应码图表数据 - 简单固定值
+	if d.responseCodes != nil {
+		d.responseCodes.Data = []float64{80, 5, 15}
+		d.responseCodes.Labels = []string{"200", "404", "500"}
+		d.responseCodes.BarColors = []termui.Color{
+			termui.ColorGreen,   // 200
+			termui.ColorRed,     // 404
+			termui.ColorMagenta, // 500
+		}
+		d.responseCodes.NumStyles = []termui.Style{
+			termui.NewStyle(termui.ColorWhite),
+			termui.NewStyle(termui.ColorWhite),
+			termui.NewStyle(termui.ColorWhite),
+		}
+	}
+
+	// 设置服务器IP统计信息 - 使用段落格式
+	d.serverIPStats = map[string]int64{
+		"192.168.1.101":  50,
+		"104.16.132.229": 30,
+		"13.225.78.102":  20,
+		"172.16.0.254":   15,
+		"9.204.177.102":  10,
+	}
+
+	// 显示服务器IP统计
+	if d.serverIPs != nil {
+		d.serverIPs.Text = "[192.168.1.101](fg:green,mod:bold)([50](fg:white)) [|](fg:red,mod:bold) [104.16.132.229](fg:green,mod:bold)([30](fg:white)) [|](fg:red,mod:bold) [13.225.78.102](fg:green,mod:bold)([20](fg:white))"
+	}
+
+	// 设置请求表格数据 - 使用更真实的数据
+	if d.requestTable != nil && len(d.requestTable.Rows) > 0 {
+		d.requestTable.Rows = [][]string{
+			{"Time", "Current Proxy", "URL", "Response Code/Time/BodySize", "Response Server/IP"},
+			{"2023/05/18 10:13", "http://jKan6GAn9yVPKdG0:EiekbLsXkFzGn7kR@geo.example.com", "http://waf.witercloud.com/login", "301/125ms/743", "apache/165.220.51.93"},
+			{"2023/05/18 10:13", "http://nd3W5Zbb75LHHVgv:s0vAnvJpTd4i6D2K@geo.example.com", "http://waf.witercloud.com", "200/100ms/1024", "nginx/127.0.0.1"},
+			{"2023/05/18 10:12", "http://JDWPP5F4JPp1XSlW:i8e493k5CQ1ExWJk@geo.example.com", "http://waf.witercloud.com/images", "503/55ms/1565", "openresty/9.204.177.102"},
+			{"2023/05/18 10:12", "http://0roPy0InnW1dCQZo:mWiIIoRQVYTCSnQs@geo.example.com", "http://waf.witercloud.com/api", "200/120ms/2048", "cloudflare/104.16.132.229"},
+			{"2023/05/18 10:11", "direct", "http://waf.witercloud.com/static/css/main.css", "200/85ms/15345", "nginx/13.225.78.102"},
+			{"2023/05/18 10:11", "http://0jUuDD0BJdAaapDn:e5PozTz2Uslog0ww@geo.example.com", "http://waf.witercloud.com/api/data", "404/210ms/512", "apache/172.16.0.254"},
+			{"2023/05/18 10:10", "http://jjNsHQi19ckAv3J4:fGBxap19PEwipQF9@geo.example.com", "http://waf.witercloud.com/?id=123", "200/140ms/1536", "nginx/192.168.1.101"},
+			{"2023/05/18 10:10", "direct", "http://waf.witercloud.com/api?token=xyz", "403/250ms/768", "cloudflare/104.16.132.229"},
+			{"2023/05/18 10:09", "http://nZPNJffpaQJcPxGD:LgGrLhI6VHfwqVlL@geo.example.com", "http://waf.witercloud.com/login?user=admin", "302/95ms/854", "apache/172.16.0.254"},
+			{"2023/05/18 10:09", "file-proxy", "http://waf.witercloud.com/", "200/115ms/1024", "nginx/192.168.1.101"},
+		}
+
+		// 确保表头样式正确
+		if d.requestTable.RowStyles == nil {
+			d.requestTable.RowStyles = make(map[int]termui.Style)
+		}
+		d.requestTable.RowStyles[0] = termui.NewStyle(termui.ColorGreen, termui.ColorClear, termui.ModifierBold)
+	}
+}
+
+// HandleSignals sets up signal handling
+func (d *Dashboard) HandleSignals() {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		d.Stop()
+	}()
+}
+
+// SetRowSpacing 设置行间距
+func (d *Dashboard) SetRowSpacing(spacing int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if spacing >= 0 && spacing <= 5 { // 限制间距在合理范围内
+		d.rowSpacing = spacing
+		fmt.Printf("[Dashboard] Row spacing set to %d\n", spacing)
+	} else {
+		fmt.Printf("[Dashboard] Invalid row spacing %d, must be between 0-5\n", spacing)
+	}
+}
+
+// updateNetworkStats 更新网络统计信息
+func (d *Dashboard) updateNetworkStats() {
+	// 确保networkStatsBox已初始化
+	if d.networkStatsBox == nil {
+		d.networkStatsBox = widgets.NewParagraph()
+		d.networkStatsBox.Title = "Network Stats"
+		d.networkStatsBox.BorderStyle.Fg = termui.ColorYellow
+		d.networkStatsBox.TitleStyle.Fg = termui.ColorYellow
+	}
+
+	// 设置最小值，避免显示为0
+	minBandwidth := 0.01     // 最小带宽为0.01 Mbps
+	minTotalTraffic := 0.001 // 最小流量为0.001 GB
+
+	// 确保带宽至少为最小值
+	bandwidth := math.Max(d.bandwidth, minBandwidth)
+	totalTraffic := math.Max(d.totalTraffic, minTotalTraffic)
+
+	// 确保代理带宽在合理范围内(至少10%的总带宽，最多90%)
+	proxyBandwidth := d.proxyBandwidth
+	proxyBandwidth = math.Max(proxyBandwidth, bandwidth*0.1) // 至少是总带宽的10%
+	proxyBandwidth = math.Min(proxyBandwidth, bandwidth*0.9) // 最多是总带宽的90%
+
+	// 计算上传和下载速度
+	uploadSpeed := bandwidth * 0.3   // 默认上传占30%
+	downloadSpeed := bandwidth * 0.7 // 默认下载占70%
+
+	// 计算代理带宽占总带宽的百分比
+	proxyPercentage := (proxyBandwidth / bandwidth) * 100
+
+	// 更新网络统计信息
+	d.networkStatsBox.Text = fmt.Sprintf("Bandwidth: %.2f Mbps\nTotal Traffic: %.3f GB\nProxy Bandwidth: %.2f Mbps (%.1f%%)\nUpload: %.2f Mbps  Download: %.2f Mbps",
+		bandwidth, totalTraffic, proxyBandwidth, proxyPercentage, uploadSpeed, downloadSpeed)
+
+	// 保存更新后的值
+	d.bandwidth = bandwidth
+	d.totalTraffic = totalTraffic
+	d.proxyBandwidth = proxyBandwidth
+
+	// 调试输出 - always print to console for debugging
+	log.Printf("[DEBUG] Network Stats: BW=%.2f Mbps, Traffic=%.3f GB, Proxy BW=%.2f Mbps (%.1f%%), Up=%.2f Mbps, Down=%.2f Mbps",
+		bandwidth, totalTraffic, proxyBandwidth, proxyPercentage, uploadSpeed, downloadSpeed)
+	log.Printf("[调试] 网络统计: 带宽=%.2f Mbps, 流量=%.3f GB, 代理带宽=%.2f Mbps (%.1f%%), 上传=%.2f Mbps, 下载=%.2f Mbps",
+		bandwidth, totalTraffic, proxyBandwidth, proxyPercentage, uploadSpeed, downloadSpeed)
+}
+
+// SaveUIConfig saves the current UI configuration to a file
+func (d *Dashboard) SaveUIConfig() error {
+	// Create a local copy of the configuration to avoid race conditions
+	d.mu.Lock()
+	config := d.uiConfig
+	d.mu.Unlock()
+
+	// Convert to JSON
+	configJSON, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal UI config: %v", err)
+	}
+
+	// Create config directory if it doesn't exist
+	configDir := os.ExpandEnv("${HOME}/.config/goto-http")
+	err = os.MkdirAll(configDir, 0755)
+	if err != nil {
+		return fmt.Errorf("failed to create config directory: %v", err)
+	}
+
+	// Write to file
+	configFile := filepath.Join(configDir, "ui_config.json")
+	err = ioutil.WriteFile(configFile, configJSON, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to write config file: %v", err)
+	}
+
+	fmt.Printf("[Dashboard] UI configuration saved to %s\n", configFile)
+	return nil
+}
+
+// LoadUIConfig loads the UI configuration from a file
+func (d *Dashboard) LoadUIConfig() error {
+	configDir := os.ExpandEnv("${HOME}/.config/goto-http")
+	configFile := filepath.Join(configDir, "ui_config.json")
+
+	// Check if file exists
+	_, err := os.Stat(configFile)
+	if os.IsNotExist(err) {
+		return fmt.Errorf("config file does not exist")
+	} else if err != nil {
+		return fmt.Errorf("failed to access config file: %v", err)
+	}
+
+	// Read file
+	configJSON, err := ioutil.ReadFile(configFile)
+	if err != nil {
+		return fmt.Errorf("failed to read config file: %v", err)
+	}
+
+	// Parse JSON
+	var config UIConfig
+	err = json.Unmarshal(configJSON, &config)
+	if err != nil {
+		return fmt.Errorf("failed to parse config file: %v", err)
+	}
+
+	// Apply configuration
+	d.mu.Lock()
+	d.uiConfig = &config
+	d.mu.Unlock()
+
+	fmt.Printf("[Dashboard] UI configuration loaded from %s\n", configFile)
+	return nil
+}
+
+// LockCurrentUILayout saves the current UI configuration to prevent future updates from changing it
+func (d *Dashboard) LockCurrentUILayout() error {
+	fmt.Println("[Dashboard] Saving current UI layout configuration...")
+
+	// Grab a copy of the current valid state
+	d.mu.Lock()
+	// The current UI config is already in d.uiConfig, so we don't need to modify it
+	d.mu.Unlock()
+
+	// Save the current configuration to file
+	err := d.SaveUIConfig()
+	if err != nil {
+		return fmt.Errorf("failed to save UI layout: %v", err)
+	}
+
+	fmt.Println("[Dashboard] Current UI layout locked and saved")
+	return nil
+}
+
+// RestoreDefaultLayout resets the UI configuration to default values
+func (d *Dashboard) RestoreDefaultLayout() error {
+	fmt.Println("[Dashboard] Restoring default UI layout...")
+
+	// Create a new default configuration
+	defaultConfig := NewUIConfig()
+
+	// Apply it to the dashboard
+	d.mu.Lock()
+	d.uiConfig = defaultConfig
+	d.mu.Unlock()
+
+	// Save it to overwrite any existing configuration
+	err := d.SaveUIConfig()
+	if err != nil {
+		return fmt.Errorf("failed to save default UI layout: %v", err)
+	}
+
+	// Immediately apply the changes
+	d.render()
+
+	fmt.Println("[Dashboard] Default UI layout restored")
+	return nil
+}
+
+// ToggleComponentVisibility toggles the visibility of a specific component
+func (d *Dashboard) ToggleComponentVisibility(componentName string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if _, exists := d.uiConfig.ComponentVisibility[componentName]; !exists {
+		return fmt.Errorf("unknown component: %s", componentName)
+	}
+
+	// Toggle visibility
+	d.uiConfig.ComponentVisibility[componentName] = !d.uiConfig.ComponentVisibility[componentName]
+
+	// Log the change
+	visibility := "hidden"
+	if d.uiConfig.ComponentVisibility[componentName] {
+		visibility = "visible"
+	}
+	fmt.Printf("[Dashboard] Component %s is now %s\n", componentName, visibility)
+
+	// Render the UI with the new settings
+	d.render()
+
+	return nil
+}
+
+// SetDataFormatter sets the format string for a specific data type
+func (d *Dashboard) SetDataFormatter(dataType string, formatStr string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Validate the format string with a simple test
+	testValue := 123.456
+	testResult := fmt.Sprintf(formatStr, testValue)
+	if testResult == "" {
+		return fmt.Errorf("invalid format string '%s': produced empty result", formatStr)
+	}
+
+	// Update the formatter in the configuration
+	d.uiConfig.DataFormatters[dataType] = formatStr
+
+	fmt.Printf("[Dashboard] Updated formatter for %s to: %s\n", dataType, formatStr)
+
+	// Save the configuration
+	if err := d.SaveUIConfig(); err != nil {
+		fmt.Printf("[Dashboard] Warning: failed to save UI config: %v\n", err)
+	}
+
+	return nil
+}
+
+// GetFormattedValue formats a value according to its data type configuration
+func (d *Dashboard) GetFormattedValue(dataType string, value interface{}) string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	// Get format string from configuration
+	formatStr, exists := d.uiConfig.DataFormatters[dataType]
+	if !exists {
+		// Default format based on type
+		switch value.(type) {
+		case float64, float32:
+			return fmt.Sprintf("%.2f", value)
+		case int, int64, uint64:
+			return fmt.Sprintf("%d", value)
+		default:
+			return fmt.Sprintf("%v", value)
+		}
+	}
+
+	// Apply format string
+	return fmt.Sprintf(formatStr, value)
+}

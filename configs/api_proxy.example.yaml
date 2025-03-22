@@ -1,0 +1,86 @@
+# goto-http 代理配置文件示例
+version: "1.0.0"
+
+# 代理配置部分
+proxy:
+  # 是否启用代理
+  enable: true
+  # 代理类型：none, local, api
+  type: "api"
+  
+  # 代理提供者列表
+  providers:
+    # 代理提供者1
+    - name: "provider1"  # 提供者名称
+      api_url: "https://api.flyproxy.com/web_v1/ip/get-ip-v3?num=500&protocol=1&format=txt&lb=\r\n&life=30&upid=355587&pt=11&app_key=0feb9bdfa1a5498df0583402819f2eb3"
+      weight: 10  # 权重，用于负载均衡
+      countries:  # 支持的国家/地区列表
+        - "US"
+        - "UK"
+        - "CA"
+        - "DE"
+        - "FR"
+        - "JP"
+      protocols:  # 支持的协议类型
+        - "http"
+        - "https"
+        - "socks5"
+      params:  # API请求参数
+        timeout: 5000
+        anonymity: "high"
+        ssl: "yes"
+
+    # 代理提供者2
+    - name: "provider2"
+      api_url: "https://proxy-provider2.com/api/proxies"
+      api_key: "your_api_key_here"  # API密钥，可选
+      api_token: "Bearer your_token_here"  # API令牌，可选
+      weight: 5
+      countries:
+        - "US"
+        - "UK"
+        - "DE"
+      protocols:
+        - "http"
+        - "https"
+
+  # 代理设置
+  settings:
+    timeout: "3s"          # 代理请求超时时间
+    interval: "1m"         # 代理检查间隔
+    max_fails: 5           # 最大失败次数
+    retry_times: 3         # 重试次数
+    failover: true         # 是否启用故障转移
+    validate_enable: true  # 是否启用代理验证
+    validate_url: "http://www.baidu.com"  # 验证URL
+    validate_timeout: "5s"  # 验证超时时间
+
+  # 代理筛选条件
+  filters:
+    # 延迟筛选
+    latency:
+      max: 1000  # 最大延迟(ms)
+      min: 0     # 最小延迟(ms)
+    # 在线时间筛选
+    uptime:
+      min: 95    # 最小在线率(%)
+    # 成功率筛选
+    success_rate:
+      min: 90    # 最小成功率(%)
+    # 带宽筛选
+    bandwidth:
+      min: 1     # 最小带宽
+      unit: "mbps"  # 带宽单位
+
+  # 代理轮换设置
+  rotation:
+    enable: true            # 是否启用轮换
+    interval: "10s"         # 轮换间隔
+    strategy: "round-robin" # 轮换策略：round-robin, random, weighted
+    max_uses: 100          # 单个代理最大使用次数
+
+  # 代理缓存设置
+  cache:
+    enable: true  # 是否启用缓存
+    size: 1000    # 缓存大小
+    ttl: "1h"     # 缓存有效期 

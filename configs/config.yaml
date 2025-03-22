@@ -1,0 +1,132 @@
+# goto-http 代理配置文件示例
+version: "1.0"
+# 代理配置使用--proxy-type或者-P 参数来决定使用哪种代理方式
+# none： 为本地模式，不是使用代理，直接使用本地网络请求目标
+# file : 根据启用了file节点，随机分配请求目标
+# api : 通过请求启用了api节点获取代理列表，随机分配请求目标
+# server: 这里不是API模式，是代理服务器类型，可以直接分配给client直接请求目标（需要携带params参数, 例如：）
+
+file: #LoadProxiesFromFile() 通过该函数获取代理列表，如果代理没有协议，则默认使用http协议
+  enable: true
+  type: "file"
+  nodes: 
+    - name: "file1"
+      enable: true
+      type: "file"
+      path: "configs/proxies.txt"
+
+    - name: "file2"
+      enable: false
+      type: "file"
+      path: "configs/proxies2.txt"
+
+server:
+  # 代理服务器类型，获取params参数后组成代理连接直接可以分配给client直接请求目标
+  # 例如组合：http://username_session-{random}_life-30:password@ip:port
+  enable: true
+  type: "server"
+  # 代理提供者列表
+  nodes:
+    # 代理提供者1
+    - name: "server1"  # 提供者名称
+      enable: True
+      type: "server"  # 代理服务器分发模式，直接请求
+      api_url: "http://proxy.res.flyproxy.com:1212"
+      support_countrys: false
+      countries: []  # 这个参数用于接受命令行参数 --proxy-countrys CN,HK,TW
+      params: # LoadProxiesFromServer()获取整个params，因为下面的子参数可能不是固定的，可根据遍历获取不为空的参数
+        username: "fly-proxy1234"
+        password: "proxy1234"
+        session: "random"     # 使用"random"或"auto"来自动生成6-12位的随机session
+        # life: 30                 # IP生存时间，单位分钟
+        # area: ""             # 地区代码，如果countries不为空，则使用countries的随机值
+        # city: ""             # 城市名称，可选
+        # state: ""            # 州/省名称，可选
+        # timeout: 10000          # 超时时间，毫秒
+    
+    # 代理提供者1
+    - name: "server2"  # 提供者名称
+      enable: False
+      type: "server"  # 代理服务器分发模式，直接请求
+      api_url: "http://proxy.res.flyproxy.com:1212"
+      support_countrys: false
+      countries: []  # 这个参数用于接受命令行参数 --proxy-countrys CN,HK,TW
+      params: # LoadProxiesFromServer()获取整个params，因为下面的子参数可能不是固定的，可根据遍历获取不为空的参数
+        username: "fly-proxy1234"
+        password: "proxy1234"
+        session: "random"     # 使用"random"或"auto"来自动生成6-12位的随机session
+        # life: 30                 # IP生存时间，单位分钟
+        # area: ""             # 地区代码，如果countries不为空，则使用countries的随机值
+        # city: ""             # 城市名称，可选
+        # state: ""            # 州/省名称，可选
+        # timeout: 10000          # 超时时间，毫秒
+
+api:
+  enable: true
+  type: "api"
+  nodes:
+    - name: "api1"
+      enable: true
+      support_countrys: true
+      type: "api"
+      api_url: "https://api.flyproxy.com/web_v1/ip/get-ip-v3"
+      params:
+        app_key: "0feb9bdfa1a5498df0583402819f2eb3"
+        num: 500
+        protocol: 1
+        upid: "355587"
+        pt: 11
+        format: "json"
+        life: 7200
+        name: "fly-proxy"
+        time: 30
+
+      response:
+        format: "json"
+        success_code: 200
+        json_path:
+          code: "code"
+          message: "msg"
+          data: "data"
+          proxy_list: "data.list"
+    
+    - name: "api2"
+      enable: false
+      support_countrys: true
+      type: "api"
+      api_url: "https://api.flyproxy.com/web_v1/ip/get-ip-v3"
+      params:
+        app_key: "0feb9bdfa1a5498df0583402819f2eb3"
+        num: 10
+        protocol: 1
+        upid: "355587"
+        pt: 11
+        format: "json"
+        life: 7200
+        name: "fly-proxy"
+        time: 0
+      response:
+        format: "json"
+        success_code: 200
+        json_path:
+          code: "code"
+          message: "msg"
+          data: "data"
+          proxy_list: "data.list"
+
+# 代理设置
+settings:
+  timeout: "3s"          # 代理请求超时时间
+  interval: "100ms"      # 代理检查间隔
+  max_fails: 3           # 最大失败次数
+  retry_times: 3         # 重试次数
+  failover: true         # 是否启用故障转移
+  validate_enable: true  # 是否启用代理验证
+  validate_url: "https://httpbin.org/ip"  # 验证URL
+  validate_timeout: "5s"  # 验证超时时间
+  rotate_interval: "1ms"  # 每次请求都轮换代理
+  min_proxies: 10        # 保持至少10个代理
+  max_reuse: 1           # 每个代理只使用一次
+  force_rotate: true     # 强制轮换代理
+  max_conns: 100         # 最大连接总数
+  max_conns_per_host: 100 # 每个主机的最大连接数

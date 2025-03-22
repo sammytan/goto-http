@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>攻击监控仪表盘</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>攻击监控仪表盘</h1>
+            <nav>
+                <a href="/">首页</a>
+                <a href="/dashboard" class="active">仪表盘</a>
+                <a href="/attacks">攻击列表</a>
+                <a href="/proxies">代理管理</a>
+            </nav>
+        </header>
+
+        <main>
+            <div class="stats-grid">
+                <!-- 实时统计 -->
+                <div class="stat-card" id="request-stats">
+                    <h3>请求统计</h3>
+                    <div class="stat-value" id="total-requests">0</div>
+                    <div class="stat-label">总请求数</div>
+                    <div class="stat-chart" id="request-chart"></div>
+                </div>
+
+                <div class="stat-card" id="success-stats">
+                    <h3>成功率</h3>
+                    <div class="stat-value" id="success-rate">0%</div>
+                    <div class="stat-label">请求成功率</div>
+                    <div class="stat-chart" id="success-chart"></div>
+                </div>
+
+                <div class="stat-card" id="latency-stats">
+                    <h3>延迟统计</h3>
+                    <div class="stat-value" id="avg-latency">0ms</div>
+                    <div class="stat-label">平均延迟</div>
+                    <div class="stat-chart" id="latency-chart"></div>
+                </div>
+
+                <div class="stat-card" id="error-stats">
+                    <h3>错误统计</h3>
+                    <div class="stat-value" id="error-rate">0%</div>
+                    <div class="stat-label">错误率</div>
+                    <div class="stat-chart" id="error-chart"></div>
+                </div>
+            </div>
+
+            <div class="detail-panels">
+                <!-- 代理状态 -->
+                <div class="panel" id="proxy-status">
+                    <h3>代理状态</h3>
+                    <div class="proxy-list" id="proxy-list">
+                        <!-- 代理列表将通过JavaScript动态更新 -->
+                    </div>
+                </div>
+
+                <!-- 攻击日志 -->
+                <div class="panel" id="attack-logs">
+                    <h3>攻击日志</h3>
+                    <div class="log-container" id="log-container">
+                        <!-- 日志将通过JavaScript动态更新 -->
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="/static/js/dashboard.js"></script>
+</body>
+</html> 
